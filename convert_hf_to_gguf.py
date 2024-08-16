@@ -2507,38 +2507,75 @@ class NomicBertModel(BertModel):
 
 
 @Model.register("XLMRobertaModel")
-class XLMRobertaModel(BertModel):
-    model_arch = gguf.MODEL_ARCH.BERT
+class XLMRobertaModel(Model):
+    model_arch = gguf.MODEL_ARCH.XLMROBERTA
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.vocab_size = None
 
-        # we need the pad_token_id to know how to chop down position_embd matrix
-        if (pad_token_id := self.hparams.get("pad_token_id")) is not None:
-            self._position_offset = 1 + pad_token_id
-            if "max_position_embeddings" in self.hparams:
-                self.hparams["max_position_embeddings"] -= self._position_offset
-        else:
-            self._position_offset = None
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_causal_attention(False)
+
+        # get pooling path
+        pooling_path = None
+        module_path = self.dir_model / "modules.json"
+        if module_path.is_file():
+            with open(module_path, encoding="utf-8") as f:
+                modules = json.load(f)
+            for mod in modules:
+                if mod["type"] == "sentence_transformers.models.Pooling":
+                    pooling_path = mod["path"]
+                    break
+
+        # get pooling type
+        if pooling_path is not None:
+            with open(self.dir_model / pooling_path / "config.json", encoding="utf-8") as f:
+                pooling = json.load(f)
+            if pooling["pooling_mode_mean_tokens"]:
+                pooling_type = gguf.PoolingType.MEAN
+            elif pooling["pooling_mode_cls_token"]:
+                pooling_type = gguf.PoolingType.CLS
+            else:
+                raise NotImplementedError("Only MEAN and CLS pooling types supported")
+            self.gguf_writer.add_pooling_type(pooling_type)
 
     def set_vocab(self):
-        # to avoid TypeError: Descriptors cannot be created directly
-        # exception when importing sentencepiece_model_pb2
-        os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+        self._set_vocab_sentencepiece()
+        self.gguf_writer.add_token_type_count(int(self.hparams['type_vocab_size']))
+        self.gguf_writer.add_add_bos_token(True)
+        self.gguf_writer.add_add_eos_token(True)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        del bid  # unused
+
+        # we are only using BERT for embeddings so we don't need the pooling layer
+        if name in ("embeddings.position_ids", "pooler.dense.weight", "pooler.dense.bias"):
+            return [] # we don't need these
+
+        return [(self.map_tensor_name(name), data_torch)]
+    
+    def _set_vocab_sentencepiece(self):
+        tokens, scores, toktypes = self._create_vocab_sentencepiece()
+
+        self.gguf_writer.add_tokenizer_model("llama")
+        self.gguf_writer.add_tokenizer_pre("multilingual-e5")
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_scores(scores)
+        self.gguf_writer.add_token_types(toktypes)
+
+        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
+        special_vocab.add_to_gguf(self.gguf_writer)
+
+    def _create_vocab_sentencepiece(self):
         from sentencepiece import SentencePieceProcessor
-        from sentencepiece import sentencepiece_model_pb2 as model
 
-        tokenizer_path = self.dir_model / 'sentencepiece.bpe.model'
+        tokenizer_path = self.dir_model / 'tokenizer.model'
         if not tokenizer_path.is_file():
-            raise FileNotFoundError(f"File not found: {tokenizer_path}")
-
-        sentencepiece_model = model.ModelProto()  # pyright: ignore[reportAttributeAccessIssue]
-        sentencepiece_model.ParseFromString(open(tokenizer_path, "rb").read())
-        assert sentencepiece_model.trainer_spec.model_type == 1  # UNIGRAM
-
-        add_prefix = sentencepiece_model.normalizer_spec.add_dummy_prefix
-        remove_whitespaces = sentencepiece_model.normalizer_spec.remove_extra_whitespaces
-        precompiled_charsmap = sentencepiece_model.normalizer_spec.precompiled_charsmap
+            tokenizer_path = self.dir_model / 'sentencepiece.bpe.model'
+            if not tokenizer_path.is_file():
+                raise FileNotFoundError(f"File not found: {tokenizer_path}")
 
         tokenizer = SentencePieceProcessor()
         tokenizer.LoadFromFile(str(tokenizer_path))
@@ -2548,7 +2585,6 @@ class XLMRobertaModel(BertModel):
         tokens: list[bytes] = [f"[PAD{i}]".encode("utf-8") for i in range(vocab_size)]
         scores: list[float] = [-10000.0] * vocab_size
         toktypes: list[int] = [SentencePieceTokenTypes.UNUSED] * vocab_size
-
         for token_id in range(tokenizer.vocab_size()):
             piece = tokenizer.IdToPiece(token_id)
             text = piece.encode("utf-8")
@@ -2564,9 +2600,50 @@ class XLMRobertaModel(BertModel):
             elif tokenizer.IsByte(token_id):
                 toktype = SentencePieceTokenTypes.BYTE
 
-            tokens[token_id] = text
-            scores[token_id] = score
-            toktypes[token_id] = toktype
+            # the first four token should be <s>, <pad>, </s>, <unk> vocabulary of E5,
+            # but there are <s>, <pad>, </s>, "," in the sentencepiece model
+            # so add the reserve the first four token
+            tokens[token_id+1] = text
+            scores[token_id+1] = score
+            toktypes[token_id+1] = toktype
+        
+        tokens[0] = '<s>'.encode("utf-8")
+        scores[0] = 0
+        toktypes[0] = SentencePieceTokenTypes.NORMAL
+
+        added_tokens_file = self.dir_model / 'added_tokens.json'
+        if added_tokens_file.is_file():
+            with open(added_tokens_file, "r", encoding="utf-8") as f:
+                added_tokens_json = json.load(f)
+                for key in added_tokens_json:
+                    token_id = added_tokens_json[key]
+                    if token_id >= vocab_size:
+                        logger.warning(f'ignore token {token_id}: id is out of range, max={vocab_size - 1}')
+                        continue
+
+                    tokens[token_id] = key.encode("utf-8")
+                    scores[token_id] = -1000.0
+                    toktypes[token_id] = SentencePieceTokenTypes.USER_DEFINED
+
+        tokenizer_config_file = self.dir_model / 'tokenizer_config.json'
+        if tokenizer_config_file.is_file():
+            with open(tokenizer_config_file, "r", encoding="utf-8") as f:
+                tokenizer_config_json = json.load(f)
+                added_tokens_decoder = tokenizer_config_json.get("added_tokens_decoder", {})
+                for token_id, token_data in added_tokens_decoder.items():
+                    token_id = int(token_id)
+                    token: str = token_data["content"]
+                    if toktypes[token_id] != SentencePieceTokenTypes.UNUSED:
+                        if tokens[token_id] != token.encode("utf-8"):
+                            logger.warning(f'replacing token {token_id}: {tokens[token_id].decode("utf-8")!r} -> {token!r}')
+                    if token_data.get("special") or self.does_token_look_special(token):
+                        toktypes[token_id] = SentencePieceTokenTypes.CONTROL
+                    else:
+                        token = token.replace(b"\xe2\x96\x81".decode("utf-8"), " ")  # pre-normalize user-defined spaces
+                        toktypes[token_id] = SentencePieceTokenTypes.USER_DEFINED
+
+                    scores[token_id] = -1000.0
+                    tokens[token_id] = token.encode("utf-8")
 
         if vocab_size > len(tokens):
             pad_count = vocab_size - len(tokens)
@@ -2576,40 +2653,113 @@ class XLMRobertaModel(BertModel):
                 scores.append(-1000.0)
                 toktypes.append(SentencePieceTokenTypes.UNUSED)
 
-        # realign tokens (see HF tokenizer code)
-        tokens = [b'<s>', b'<pad>', b'</s>', b'<unk>'] + tokens[3:-1]
-        scores = [0.0, 0.0, 0.0, 0.0] + scores[3:-1]
-        toktypes = [
-            SentencePieceTokenTypes.CONTROL,
-            SentencePieceTokenTypes.CONTROL,
-            SentencePieceTokenTypes.CONTROL,
-            SentencePieceTokenTypes.UNKNOWN,
-        ] + toktypes[3:-1]
+        return tokens, scores, toktypes
 
-        self.gguf_writer.add_tokenizer_model("t5")
-        self.gguf_writer.add_tokenizer_pre("default")
-        self.gguf_writer.add_token_list(tokens)
-        self.gguf_writer.add_token_scores(scores)
-        self.gguf_writer.add_token_types(toktypes)
-        self.gguf_writer.add_add_space_prefix(add_prefix)
-        self.gguf_writer.add_token_type_count(1)
-        self.gguf_writer.add_remove_extra_whitespaces(remove_whitespaces)
-        if precompiled_charsmap:
-            self.gguf_writer.add_precompiled_charsmap(precompiled_charsmap)
 
-        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
-        special_vocab.add_to_gguf(self.gguf_writer)
+# @Model.register("XLMRobertaModel")
+# class XLMRobertaModel(BertModel):
+#     model_arch = gguf.MODEL_ARCH.BERT
 
-        self.gguf_writer.add_add_bos_token(True)
-        self.gguf_writer.add_add_eos_token(True)
+#     def __init__(self, *args, **kwargs):
+#         super().__init__(*args, **kwargs)
 
-    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        # position embeddings start at pad_token_id + 1, so just chop down the weight tensor
-        if name == "embeddings.position_embeddings.weight":
-            if self._position_offset is not None:
-                data_torch = data_torch[self._position_offset:,:]
+#         # we need the pad_token_id to know how to chop down position_embd matrix
+#         if (pad_token_id := self.hparams.get("pad_token_id")) is not None:
+#             self._position_offset = 1 + pad_token_id
+#             if "max_position_embeddings" in self.hparams:
+#                 self.hparams["max_position_embeddings"] -= self._position_offset
+#         else:
+#             self._position_offset = None
 
-        return super().modify_tensors(data_torch, name, bid)
+#     def set_vocab(self):
+#         # to avoid TypeError: Descriptors cannot be created directly
+#         # exception when importing sentencepiece_model_pb2
+#         os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+#         from sentencepiece import SentencePieceProcessor
+#         from sentencepiece import sentencepiece_model_pb2 as model
+
+#         tokenizer_path = self.dir_model / 'sentencepiece.bpe.model'
+#         if not tokenizer_path.is_file():
+#             raise FileNotFoundError(f"File not found: {tokenizer_path}")
+
+#         sentencepiece_model = model.ModelProto()  # pyright: ignore[reportAttributeAccessIssue]
+#         sentencepiece_model.ParseFromString(open(tokenizer_path, "rb").read())
+#         assert sentencepiece_model.trainer_spec.model_type == 1  # UNIGRAM
+
+#         add_prefix = sentencepiece_model.normalizer_spec.add_dummy_prefix
+#         remove_whitespaces = sentencepiece_model.normalizer_spec.remove_extra_whitespaces
+#         precompiled_charsmap = sentencepiece_model.normalizer_spec.precompiled_charsmap
+
+#         tokenizer = SentencePieceProcessor()
+#         tokenizer.LoadFromFile(str(tokenizer_path))
+
+#         vocab_size = self.hparams.get('vocab_size', tokenizer.vocab_size())
+
+#         tokens: list[bytes] = [f"[PAD{i}]".encode("utf-8") for i in range(vocab_size)]
+#         scores: list[float] = [-10000.0] * vocab_size
+#         toktypes: list[int] = [SentencePieceTokenTypes.UNUSED] * vocab_size
+
+#         for token_id in range(tokenizer.vocab_size()):
+#             piece = tokenizer.IdToPiece(token_id)
+#             text = piece.encode("utf-8")
+#             score = tokenizer.GetScore(token_id)
+
+#             toktype = SentencePieceTokenTypes.NORMAL
+#             if tokenizer.IsUnknown(token_id):
+#                 toktype = SentencePieceTokenTypes.UNKNOWN
+#             elif tokenizer.IsControl(token_id):
+#                 toktype = SentencePieceTokenTypes.CONTROL
+#             elif tokenizer.IsUnused(token_id):
+#                 toktype = SentencePieceTokenTypes.UNUSED
+#             elif tokenizer.IsByte(token_id):
+#                 toktype = SentencePieceTokenTypes.BYTE
+
+#             tokens[token_id] = text
+#             scores[token_id] = score
+#             toktypes[token_id] = toktype
+
+#         if vocab_size > len(tokens):
+#             pad_count = vocab_size - len(tokens)
+#             logger.debug(f"Padding vocab with {pad_count} token(s) - [PAD1] through [PAD{pad_count}]")
+#             for i in range(1, pad_count + 1):
+#                 tokens.append(bytes(f"[PAD{i}]", encoding="utf-8"))
+#                 scores.append(-1000.0)
+#                 toktypes.append(SentencePieceTokenTypes.UNUSED)
+
+#         # realign tokens (see HF tokenizer code)
+#         tokens = [b'<s>', b'<pad>', b'</s>', b'<unk>'] + tokens[3:-1]
+#         scores = [0.0, 0.0, 0.0, 0.0] + scores[3:-1]
+#         toktypes = [
+#             SentencePieceTokenTypes.CONTROL,
+#             SentencePieceTokenTypes.CONTROL,
+#             SentencePieceTokenTypes.CONTROL,
+#             SentencePieceTokenTypes.UNKNOWN,
+#         ] + toktypes[3:-1]
+
+#         self.gguf_writer.add_tokenizer_model("t5")
+#         self.gguf_writer.add_tokenizer_pre("default")
+#         self.gguf_writer.add_token_list(tokens)
+#         self.gguf_writer.add_token_scores(scores)
+#         self.gguf_writer.add_token_types(toktypes)
+#         self.gguf_writer.add_add_space_prefix(add_prefix)
+#         self.gguf_writer.add_token_type_count(1)
+#         self.gguf_writer.add_remove_extra_whitespaces(remove_whitespaces)
+#         if precompiled_charsmap:
+#             self.gguf_writer.add_precompiled_charsmap(precompiled_charsmap)
+
+#         special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
+#         special_vocab.add_to_gguf(self.gguf_writer)
+
+#         self.gguf_writer.add_add_bos_token(True)
+#         self.gguf_writer.add_add_eos_token(True)
+
+#     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+#         # position embeddings start at pad_token_id + 1, so just chop down the weight tensor
+#         if name == "embeddings.position_embeddings.weight":
+#             if self._position_offset is not None:
+#                 data_torch = data_torch[self._position_offset:,:]
+
+#         return super().modify_tensors(data_torch, name, bid)
 
 
 @Model.register("GemmaForCausalLM")
